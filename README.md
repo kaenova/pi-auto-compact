@@ -7,30 +7,24 @@ Compaction itself always reuses Pi's built-in `ctx.compact()` implementation. Pi
 ## Install
 
 ```bash
-pi install npm:pi-auto-compact
-```
-
-Or install directly from GitHub:
-
-```bash
-pi install git:github.com/Chasen-Liao/pi-auto-compact
+pi install git:github.com/kaenova/pi-auto-compact
 ```
 
 ## Configuration
 
-The default threshold is **78% used**. Change it inside Pi with:
+The default threshold is **80% used**. Change it inside Pi with:
 
 ```text
 /compact-threshold 50
 ```
 
-Values are 30–98; 99 is rejected because compaction itself needs headroom. This saves the setting atomically (merging into the existing file, so other keys survive). Show the current value:
+Values are 1-99; 99 is rejected because compaction itself needs headroom. This saves the setting atomically (merging into the existing file, so other keys survive). Show the current value:
 
 ```text
 /compact-threshold
 ```
 
-Reset to the default 78%:
+Reset to the default 80%:
 
 ```text
 /compact-threshold reset

@@ -13,7 +13,7 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-const DEFAULT_THRESHOLD = 78;
+const DEFAULT_THRESHOLD = 80;
 /**
  * Legal threshold window: [MIN_THRESHOLD, MAX_THRESHOLD). The lower bound keeps
  * preflight meaningful: Pi's compaction keeps ~`keepRecentTokens` (20000 by
@@ -22,7 +22,7 @@ const DEFAULT_THRESHOLD = 78;
  * per prompt. The upper bound excludes 99: compaction itself needs headroom,
  * so a 99% trigger is already too late to be useful.
  */
-const MIN_THRESHOLD = 30;
+const MIN_THRESHOLD = 1;
 const MAX_THRESHOLD = 99;
 const STATUS_KEY = "pi-auto-compact";
 const CONFIG_FILE = join(getAgentDir(), "pi-auto-compact.json");
