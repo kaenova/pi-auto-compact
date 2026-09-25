@@ -1,29 +1,34 @@
 # AGENTS.md
 
-Pi 扩展：在发送 prompt 前预检上下文（当前 usage + 新输入 token），超过阈值百分比就先压缩再发送，避免长输入中断工具链。压缩始终复用 Pi 内置 `ctx.compact()`。
+Pi extension: preflight the context before sending a prompt (current usage + new input tokens). If the limit is crossed, compact first and then send, so a long input never interrupts the tool chain. The limit is an **absolute token budget** (default 150000); it does not scale with the model's window. Compaction always reuses Pi's built-in `ctx.compact()`.
 
-## 常用命令
+## Commands
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # mock 冒烟（test/smoke.ts，Node 原生 TS，PI_CODING_AGENT_DIR 指向临时目录）
-pi -e .                  # 本地加载扩展启动 pi（交互验证）
-npm version minor/patch  # 发版；npm publish 后 pi install npm:pi-auto-compact
+npm test                 # mock smoke suite (test/smoke.ts, Node native TS, PI_CODING_AGENT_DIR points at a temp dir)
+pi -e .                  # start pi with the extension loaded locally (interactive check)
+npm version minor/patch  # release; after npm publish, pi install npm:pi-auto-compact
 ```
 
-## 架构与约定
+## Architecture and conventions
 
-- 全部源码在 `extensions/auto-compact.ts`，`package.json` 的 `pi.extensions` 指向它。TS 直接由 pi 加载，无构建步骤。
-- 压缩唯一入口是 `input` 事件里的 preflight（`compactAndWait`）。**禁止**在 `turn_end`/`agent_end` 里调 `ctx.compact()`——它会 abort 正在运行的工具链。
-- 不要用 `ctx.sendUserMessage` 重发原 prompt（`input` 事件在 `prompt()` 内触发，会无限递归）；返回 `{action:"continue"}` 让原 prompt 走正常流程。
-- 异步回调必须带 `sessionGeneration` 守护 + `notifySafe`/`clearStatus` 式 try/catch，session 切换后旧 ctx 访问 UI 会抛错。
-- 已知取舍（用户裁决 1.2.2）：不做超时兜底——当前安装的扩展（pi-subagents/pi-goal 的 before_compact 均同步返回）不会挂住压缩，路径不可达；若未来某扩展异步挂住 before_compact，ctx.compact() 永不回调，-p 下 prompt 静默丢失、TUI 会话卡死，属接受的风险。软错误（Nothing to compact/Already compacted，includes 匹配）→ 放行；硬错误 → 拦下（↑键召回重发，Pi 压缩互斥锁在 compact() 挂住时不释放，重发进队列等后台落定）。
-- 配置文件 `~/.pi/agent/pi-auto-compact.json`（`getAgentDir()` 解析，env `PI_CODING_AGENT_DIR` 可重定向——冒烟测试靠它隔离）。阈值合法区间 `[30, 99)`（下限依据：Pi 压缩保留 keepRecentTokens≈20000，过低只会落入"没东西可压"软失败循环；上限排除 99：压缩本身需要余量）；手改成越界值时回退上一有效值。preflight/turn_end 每次重读（热加载跨会话生效）；写入必须 temp+rename 原子写且与现有键合并（`compactTimeoutMs` 等），先落盘成功再更新内存。
-- `peerDependencies` 锁 `@earendil-works/pi-coding-agent >=0.84.3`；升级 pi 后需复测 `ctx.compact()`/`input` 事件语义。
+- All source lives in `extensions/auto-compact.ts`, referenced by `pi.extensions` in `package.json`. Pi loads the TS directly; there is no build step.
+- The only compaction entry point is the preflight in the `input` event (`compactAndWait`). Calling `ctx.compact()` from `turn_end`/`agent_end` is **forbidden** — it aborts the running tool chain.
+- Do not resend the original prompt with `ctx.sendUserMessage` (the `input` event fires inside `prompt()`, so that recurses forever); return `{action:"continue"}` and let the original prompt take its normal path.
+- Async callbacks must carry a `sessionGeneration` guard plus `notifySafe`/`clearStatus`-style try/catch; after a session switch, touching the UI through a stale ctx throws.
+- Accepted trade-off (user decision, 1.2.2): no timeout fallback — the currently installed extensions (pi-subagents/pi-goal `before_compact` both return synchronously) never hang compaction, so the path is unreachable; if a future extension hangs `before_compact` asynchronously, `ctx.compact()` never calls back, the prompt is silently dropped under `-p`, and the TUI session freezes. That is an accepted risk. Soft errors (`Nothing to compact`/`Already compacted`, matched with `includes`) → let the prompt through; hard errors → block it (recall with ↑ and resend; Pi's compaction mutex is not released while `compact()` is hung, so the resend queues behind the background attempt).
+- Config file `~/.pi/agent/pi-auto-compact.json` (resolved via `getAgentDir()`; env `PI_CODING_AGENT_DIR` can redirect it — the smoke test relies on that for isolation). Single key `thresholdTokens` (integer, `>= 1000`; lower values are rejected rather than guessed at: they read like a mistyped percentage and would compact on every prompt). A hand-edited out-of-range value falls back to the last valid one. Preflight/turn_end re-read it every time (hot reload works across sessions). Writes must be atomic (temp+rename) and merge with existing keys (`compactTimeoutMs` etc.); update memory only after the write succeeds.
+- `peerDependencies` pins `@earendil-works/pi-coding-agent >=0.84.3`; after upgrading pi, re-test the `ctx.compact()`/`input` event semantics.
 
-## 当前状态
+## Current state
 
-- 1.2.3（当前）：ponytail 审计裁剪（净 -50 行，行为/文案不变）：node:test runner 取代手写 runner、compactAndWait 直接 resolve `Error | null`（删 settled 守卫与死字段 CompactionOutcome.ok）、clearStatus 并入 setStatus、删恒真 inFlight 守卫与 mock editor/mode 残留；冒烟扩到 12 条（补 images 投影分支，SDK 每图计 4800 字符）。
-- 1.2.2：1.2.0 消融实验（真实 pi 隔离环境，R0–R3 差分）后从 hardened-1.1.1 选择性移植：配置热加载/键合并 + 阈值 [30,99) + test/smoke.ts 入库；砍掉 abort 放行、编辑器回填（↑键可召回已实证）、compactSequence、inFlight 生命周期置空、超时兜底（1.2.2 最终裁决：当前环境触发不可达，属投机防护）。
-- 已知边界：模型未上报 `contextWindow` 时预检跳过；steer/followUp 队列消息与 skill/template 展开后的膨胀不预检，由 Pi 内置压缩兜底。
-- 验证方式：改动后跑 `npm run typecheck` + `npm test`（mock 冒烟入库，覆盖阈值/软硬失败/并发/守护/配置路径/images 投影），再用 `pi -p`/`pi -c -p` 在**隔离 cwd + 隔离 PI_CODING_AGENT_DIR** 做端到端（`pi -c` 会接同 cwd 最新 session，勿在活跃会话项目里测）。
+- 1.4.0 (current): **percentage removed, absolute token budget only** (default 150000, floor 1000). Key consequence: `resolveLimit()` returns `undefined` when `window <= thresholdTokens`, so that model gets **no preflight and no mirror**. This is deliberate: `reserveTokens = window − budget` would be negative there, and clamping it to 0 turns Pi's check into `contextTokens > contextWindow`, which *disables* the native safety net; skipping is what preserves Pi's own 16384 default. The mirror function now returns a "count written" (0 = nothing happened, which doubles as the no-notification condition).
+- 1.3.0: the limit model widened from "percentage only" to percentage or token budget, `limit = window > thresholdTokens ? thresholdTokens : window × threshold/100` (small windows fall back to the percentage).
+- 1.2.4: the threshold is mirrored into Pi's own `~/.pi/agent/settings.json` → `compaction.modelOverrides[provider/modelId].reserveTokens`. **One entry is written for every model in `ctx.modelRegistry.getAvailable()` plus the active model** (not just the active one): `reserveTokens` is an absolute token count, so a single global value cannot express a cross-window rule. Trigger points: session_start/model_select/`/compact-threshold`; unchanged values are not rewritten and not notified. This makes Pi's own between-turn check (`contextTokens > contextWindow - reserveTokens`) use the same limit as the preflight, closing the gap the preflight cannot see (steer/followUp queues, skill/template expansion). Cost: Pi caches settings at startup, so a write only takes effect after `/reload` or a restart (the extension notifies). Only `reserveTokens` is touched; other keys are merged and preserved.
+  - Evaluated and **rejected**: triggering compaction ourselves at `turn_end` (returning `{entries:[{type:"compaction",...}]}`). That needs the summary text up front, and `prepareCompaction` is not exported (the root `index.d.ts:6` export list omits it, and `package.json` `exports` only opens `.`/`./rpc-entry`, so it cannot be deep-imported). Reimplementing its ~55 lines would depend on the unexported `estimateProjectedContextTokens`/`findProjectedCutPoint`/`extractFileOperations` — version-fragile, and a wrong cut point corrupts the context. Also, `ExtensionContextActions` exposes only `compact()`; **there is no runtime API to change compaction settings**, so writing the file is the only way to make Pi's native between-turn check use our limit.
+  - Also fixed two stale tests (`5bd174f` lowered `MIN_THRESHOLD` 30→1 but the tests still used 25/20 as "out of range", so `npm test` did not fail — it **hung**), and gave the mock `ctx.compact` a default soft-failure fallback so a future case missing `onComplete` fails fast instead of hanging the suite.
+- 1.2.3: ponytail audit trim (net −50 lines, behavior/wording unchanged): `node:test` runner replaced the hand-written one, `compactAndWait` resolves `Error | null` directly (dropped the settled guard and the dead `CompactionOutcome.ok` field), `clearStatus` folded into `setStatus`, removed an always-true `inFlight` guard and leftover mock editor/mode. Smoke grew to 12 cases (added the images projection branch; the SDK charges 4800 chars per image).
+- 1.2.2: after the 1.2.0 ablation experiment (real pi in an isolated environment, R0–R3 differential), selectively ported from hardened-1.1.1: config hot reload/key merging + threshold `[30,99)` + `test/smoke.ts` committed. Dropped abort pass-through, editor refill (recall via ↑ is proven to work), `compactSequence`, `inFlight` lifecycle nulling, and the timeout fallback (1.2.2 final ruling: unreachable in this environment, so it was speculative hardening).
+- Known boundaries: when a model does not report `contextWindow`, the preflight is skipped and the mirror skips that model too; a model whose window is smaller than the budget is skipped by both (Pi's native fallback covers it). The mirror runs on session_start/model_select and the threshold command, and Pi never reloads settings by itself, so after changing the budget either `/reload` or restart. If `getAvailable()` is not yet populated at `session_start`, that model is picked up on the next start or on `model_select`.
+- Verification: after a change run `npm run typecheck` + `npm test` (the mock smoke suite covers budget/skip/soft-and-hard failure/concurrency/session guarding/config path/images projection/settings mirror; tests use `WINDOW = 100_000` with an `at(pct)` helper so assertions stay readable), then do an end-to-end run with `pi -p`/`pi -c -p` in an **isolated cwd + isolated `PI_CODING_AGENT_DIR`** (`pi -c` picks up the latest session in the same cwd, so never test inside a project with a live session).
