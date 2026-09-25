@@ -41,6 +41,41 @@ So a 150000 budget applies to a 200k or 1M window and is ignored on a 32k one. P
 
 ## Pi's own threshold is mirrored
 
+> [!WARNING]
+> **This extension writes to your Pi settings file.** Setting a budget modifies
+> `~/.pi/agent/settings.json` by adding `compaction.modelOverrides` entries — one per
+> model that can reach the budget. That changes Pi's own compaction behavior
+> globally, for every session, not just the one you are in.
+>
+> What it does and does not touch:
+>
+> - **Only adds** `compaction.modelOverrides.<provider>/<id>.reserveTokens`. It never
+>   edits other settings, and merges rather than overwrites, so unrelated keys and
+>   any overrides you already had survive.
+> - **Never removes** an override. If you later raise the budget, or `reset` back to
+>   the default, models whose window no longer exceeds the budget are skipped and
+>   keep their previously mirrored `reserveTokens`. That stale value is typically
+>   *smaller* than Pi's default 16384, meaning Pi compacts **later** than stock — so
+>   a stale mirror can be less safe than Pi's untouched default.
+> - Takes effect on `/reload` or restart; Pi caches settings at startup.
+>
+> **A backup is taken for you.** Before the first mirror write, your original
+> settings are copied to `~/.pi/agent/settings.json.bak`. It is written **once and
+> never rotated**, so it always holds the pre-extension state. Restore it with:
+>
+> ```bash
+> cp ~/.pi/agent/settings.json.bak ~/.pi/agent/settings.json
+> ```
+>
+> To stop the mirroring entirely, drop the config file and the overrides:
+>
+> ```bash
+> rm -f ~/.pi/agent/pi-auto-compact.json
+> ```
+>
+> ...then remove `compaction.modelOverrides` from `~/.pi/agent/settings.json`, or
+> restore the backup above.
+
 Setting the budget also writes Pi's own compaction setting, so Pi's between-turn check fires at the **same point**:
 
 ```json
@@ -51,7 +86,7 @@ Setting the budget also writes Pi's own compaction setting, so Pi's between-turn
 } } }
 ```
 
-An override is written for **every model that can reach the budget**, plus the active one, so the rule is model-independent: whichever model you select, Pi's own check uses your budget. `reserveTokens = contextWindow − budget` per `provider/modelId`, merged into the file — pre-existing overrides for other models and unrelated keys survive. Unchanged values are not rewritten.
+An override is written for **every model that can reach the budget**, plus the active one, so the rule is model-independent: whichever model you select, Pi's own check uses your budget. `reserveTokens = contextWindow − budget` per `provider/modelId`, merged into the file — pre-existing overrides for other models and unrelated keys survive. Unchanged values are not rewritten, and the original file is backed up to `settings.json.bak` the first time this happens.
 
 Why per model rather than one global `reserveTokens`: Pi's check is `contextTokens > contextWindow - reserveTokens`, so the reserve you need is `window − budget`, which differs per model. One global value cannot express that.
 

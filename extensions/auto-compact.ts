@@ -1,4 +1,6 @@
 import {
+	copyFileSync,
+	existsSync,
 	mkdirSync,
 	readFileSync,
 	renameSync,
@@ -23,6 +25,8 @@ const STATUS_KEY = "pi-auto-compact";
 const CONFIG_FILE = join(getAgentDir(), "pi-auto-compact.json");
 /** Pi's own global settings file, where `compaction.modelOverrides` lives. */
 const SETTINGS_FILE = join(getAgentDir(), "settings.json");
+/** One-time copy of SETTINGS_FILE, taken before the first mirror write. */
+const SETTINGS_BACKUP_FILE = `${SETTINGS_FILE}.bak`;
 /** Compaction errors meaning "the context is already as small as it can get" — safe to send the prompt anyway. */
 const SOFT_COMPACT_ERRORS = ["Nothing to compact", "Already compacted"];
 
@@ -82,6 +86,26 @@ function resolveLimit(
 /** Human-readable summary of the active rule, for notifications. */
 function describeConfig(config: CompactConfig): string {
 	return `${config.thresholdTokens} tokens`;
+}
+
+/**
+ * Copy Pi's settings aside before the first mirror write, so the pre-extension
+ * state is always recoverable.
+ *
+ * Written once and never rotated: a rotating backup would eventually overwrite
+ * the true original with an already-mirrored file. Best-effort — the mirror
+ * write only adds `modelOverrides` and merges, so it cannot lose data, and a
+ * failed copy must not block the setting the user asked for.
+ * ponytail: single backup, no history. Add rotation if multi-step undo is needed.
+ */
+function backupSettingsOnce(): void {
+	try {
+		if (existsSync(SETTINGS_BACKUP_FILE)) return;
+		if (!existsSync(SETTINGS_FILE)) return;
+		copyFileSync(SETTINGS_FILE, SETTINGS_BACKUP_FILE);
+	} catch {
+		// See above: never block the mirror write on a failed backup.
+	}
 }
 
 function readJsonObject(file: string): Record<string, unknown> {
@@ -154,6 +178,7 @@ function syncPiReserveTokens(
 		written++;
 	}
 	if (written === 0) return 0;
+	backupSettingsOnce();
 	writeJsonAtomic(SETTINGS_FILE, {
 		...settings,
 		compaction: { ...compaction, modelOverrides: overrides },

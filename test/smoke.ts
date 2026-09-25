@@ -13,7 +13,13 @@
  * extension module resolves CONFIG_FILE.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { test } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -544,4 +550,52 @@ test("/compact-threshold persists atomically, merges keys, validates input", asy
 
 	await cmd.handler("reset", h.ctx);
 	assert.ok(!existsSync(CONFIG_FILE), "reset removes the config file");
+});
+
+test("settings.json is backed up once, before the first mirror write", async () => {
+	const settingsFile = join(agentDir, "settings.json");
+	const backupFile = `${settingsFile}.bak`;
+	// Earlier tests may have mirrored already; start from a known state.
+	rmSync(backupFile, { force: true });
+
+	// Sentinel original: none of this is ours, so a faithful backup returns it verbatim.
+	const original = `${JSON.stringify({ theme: "dark", compaction: { enabled: true } }, null, 2)}\n`;
+	writeFileSync(settingsFile, original, "utf8");
+	writeConfig({ thresholdTokens: 90_000 });
+
+	const pi = install(makePi());
+	const first = makeCtx({ usage: undefined });
+	first.ctx.model = { provider: "anthropic", id: "claude", contextWindow: 200000 };
+	pi.fireSessionStart(first.ctx);
+
+	assert.equal(
+		readFileSync(backupFile, "utf8"),
+		original,
+		"backup holds the pre-extension settings verbatim",
+	);
+	assert.equal(
+		JSON.parse(readFileSync(settingsFile, "utf8")).compaction.modelOverrides[
+			"anthropic/claude"
+		].reserveTokens,
+		110000,
+		"the live file did get the mirror",
+	);
+
+	// A second write must not rotate the backup, or the true original is lost.
+	const second = makeCtx({ usage: undefined });
+	second.ctx.model = { provider: "openai", id: "big", contextWindow: 400000 };
+	pi.fireSessionStart(second.ctx);
+
+	assert.equal(
+		readFileSync(backupFile, "utf8"),
+		original,
+		"backup is written once and never rotated over the true original",
+	);
+	assert.equal(
+		JSON.parse(readFileSync(settingsFile, "utf8")).compaction.modelOverrides[
+			"openai/big"
+		].reserveTokens,
+		310000,
+		"later models still get mirrored",
+	);
 });
