@@ -142,12 +142,12 @@ type ModelLike = { provider: string; id: string; contextWindow: number };
  * model, capped at 90% of its context window. Unknown windows are skipped.
  * Existing overrides for other models and unrelated settings are preserved. Pi
  * caches settings, so a change only applies after /reload or a restart. Returns
- * the number of overrides written (0 = nothing to do).
+ * the number of overrides written, plus whether native compaction was enabled.
  */
 function syncPiReserveTokens(
 	models: readonly ModelLike[],
 	config: CompactConfig,
-): number {
+): { written: number; enabled: boolean } {
 	const settings = readJsonObject(SETTINGS_FILE);
 	const compaction = (settings.compaction ?? {}) as Record<string, unknown>;
 	const overrides = {
@@ -166,13 +166,14 @@ function syncPiReserveTokens(
 		overrides[key] = { ...existing, reserveTokens };
 		written++;
 	}
-	if (written === 0) return 0;
+	const enabled = compaction.enabled === false;
+	if (written === 0 && !enabled) return { written, enabled };
 	backupSettingsOnce();
 	writeJsonAtomic(SETTINGS_FILE, {
 		...settings,
-		compaction: { ...compaction, modelOverrides: overrides },
+		compaction: { ...compaction, enabled: true, modelOverrides: overrides },
 	});
-	return written;
+	return { written, enabled };
 }
 
 type StatusKind = "info" | "warning" | "error";
@@ -235,11 +236,11 @@ function applyConfigToPi(ctx: ExtensionContext, config: CompactConfig): void {
 			models.set(`${model.provider}/${model.id}`, model);
 		if (ctx.model)
 			models.set(`${ctx.model.provider}/${ctx.model.id}`, ctx.model);
-		const written = syncPiReserveTokens([...models.values()], config);
-		if (written === 0) return;
+		const { written, enabled } = syncPiReserveTokens([...models.values()], config);
+		if (written === 0 && !enabled) return;
 		notifySafe(
 			ctx,
-			`Pi compaction limit mirrored at ${describeConfig(config)} for ${written} model(s) (${SETTINGS_FILE}). Run /reload or restart Pi to apply.`,
+			`Pi compaction limit mirrored at ${describeConfig(config)} for ${written} model(s) (${SETTINGS_FILE}).${enabled ? " Native auto-compaction enabled for running agents." : ""} Run /reload or restart Pi to apply.`,
 			"info",
 		);
 	} catch {
