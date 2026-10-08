@@ -30,15 +30,7 @@ const SETTINGS_BACKUP_FILE = `${SETTINGS_FILE}.bak`;
 /** Compaction errors meaning "the context is already as small as it can get" — safe to send the prompt anyway. */
 const SOFT_COMPACT_ERRORS = ["Nothing to compact", "Already compacted"];
 
-/**
- * Compaction trigger: a flat token budget.
- *
- * A model whose context window cannot exceed the budget gets no preflight and no
- * mirrored reserve. That is deliberate: `reserveTokens = window - budget` would
- * be negative there, and clamping it to 0 turns Pi's own check into
- * `contextTokens > contextWindow`, which *disables* the native safety net
- * instead of tightening it. Leaving such models alone keeps Pi's default.
- */
+/** Provider-independent trigger: the budget or 90% of the model window, whichever is lower. */
 interface CompactConfig {
 	thresholdTokens: number;
 }
@@ -70,22 +62,19 @@ function loadConfig(fallback: CompactConfig = DEFAULT_CONFIG): CompactConfig {
 	}
 }
 
-/**
- * Tokens at which to compact, or undefined when the window cannot exceed the
- * budget (see CompactConfig).
- */
+/** Unknown/invalid windows cannot provide a safe trigger. */
 function resolveLimit(
 	config: CompactConfig,
 	contextWindow: number,
 ): number | undefined {
-	return contextWindow > config.thresholdTokens
-		? config.thresholdTokens
+	return Number.isFinite(contextWindow) && contextWindow > 0
+		? Math.min(config.thresholdTokens, Math.floor(contextWindow * 0.9))
 		: undefined;
 }
 
 /** Human-readable summary of the active rule, for notifications. */
 function describeConfig(config: CompactConfig): string {
-	return `${config.thresholdTokens} tokens`;
+	return `${config.thresholdTokens} tokens (capped at 90% of model context window)`;
 }
 
 /**
@@ -150,7 +139,7 @@ type ModelLike = { provider: string; id: string; contextWindow: number };
  * (`contextTokens > contextWindow - reserveTokens`) fires at the same point for
  * content the preflight cannot see (steer/followUp queues, skill/template
  * expansion). The limit is window-dependent, so this writes one override per
- * model. Models that cannot reach the budget are skipped (see CompactConfig).
+ * model, capped at 90% of its context window. Unknown windows are skipped.
  * Existing overrides for other models and unrelated settings are preserved. Pi
  * caches settings, so a change only applies after /reload or a restart. Returns
  * the number of overrides written (0 = nothing to do).

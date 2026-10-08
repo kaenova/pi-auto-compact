@@ -309,7 +309,7 @@ test("turn_end status reflects the threshold and clears below it", async () => {
 test("threshold hot-reloads from disk between prompts", async () => {
 	writeConfig({ thresholdTokens: 95_000 });
 	const pi = install(makePi());
-	const calm = makeCtx({ usage: at(90) });
+	const calm = makeCtx({ usage: at(89) });
 	await pi.fireInput({ text: "hi" }, calm.ctx);
 	assert.equal(calm.compacts.length, 0, "90% < 95% threshold");
 
@@ -323,12 +323,12 @@ test("threshold hot-reloads from disk between prompts", async () => {
 
 	// Out-of-range hand edits must fall back to the last valid value (92), not the tampered one.
 	writeConfig({ thresholdTokens: 92_000 });
-	const above92 = makeCtx({ usage: at(90) });
+	const above92 = makeCtx({ usage: at(89) });
 	await pi.fireInput({ text: "hi" }, above92.ctx);
 	assert.equal(above92.compacts.length, 0, "90% < 92%");
 
 	writeConfig({ thresholdTokens: 0 }); // below the floor: reject, keep 92_000
-	const tampered = makeCtx({ usage: at(90) });
+	const tampered = makeCtx({ usage: at(89) });
 	await pi.fireInput({ text: "hi" }, tampered.ctx);
 	assert.equal(tampered.compacts.length, 0, "tampered 0.5% must not take effect");
 });
@@ -348,7 +348,7 @@ test("threshold is mirrored into Pi settings.json for every available model", as
 	);
 	writeConfig({ thresholdTokens: 75_000 });
 	const pi = install(makePi());
-	// The budget must be reachable: 32k cannot reach 75k, 120k can.
+	// Small windows use the 90% cap; larger windows use the budget.
 	const h = makeCtx({
 		usage: undefined,
 		availableModels: [
@@ -369,10 +369,10 @@ test("threshold is mirrored into Pi settings.json for every available model", as
 		{ reserveTokens: 45000 },
 		"every model that can reach the budget gets window - budget",
 	);
-	assert.equal(
+	assert.deepEqual(
 		saved.compaction.modelOverrides["openai/mini"],
-		undefined,
-		"a window below the budget is skipped, keeping Pi's own default",
+		{ reserveTokens: 3200 },
+		"32k window reserves 10%",
 	);
 	assert.equal(
 		saved.compaction.modelOverrides["other/model"].reserveTokens,
@@ -381,7 +381,7 @@ test("threshold is mirrored into Pi settings.json for every available model", as
 	);
 	assert.equal(saved.compaction.enabled, true, "sibling keys survive");
 	assert.equal(saved.theme, "dark", "unrelated settings survive");
-	assert.match(h.notifies.at(-1)!.text, /2 model\(s\)/);
+	assert.match(h.notifies.at(-1)!.text, /3 model\(s\)/);
 
 	// Unchanged values: no write, no notification.
 	const before = readFileSync(settingsFile, "utf8");
@@ -447,7 +447,7 @@ test("/compact-threshold re-syncs the mirrored reserveTokens", async () => {
 	);
 });
 
-test("a token budget triggers early on large windows and skips unreachable ones", async () => {
+test("all providers use the lower of the budget and 90% of the window", async () => {
 	const pi = install(makePi());
 	writeConfig({ thresholdTokens: 150_000 });
 
@@ -463,19 +463,24 @@ test("a token budget triggers early on large windows and skips unreachable ones"
 	await pi.fireInput({ text: "hi" }, underBudget.ctx);
 	assert.equal(underBudget.compacts.length, 0, "149k < 150k budget");
 
-	// 100k window can never reach 150k, so the preflight is skipped entirely.
-	const small = makeCtx({ usage: { tokens: 99000, contextWindow: 100000 } });
+	const belowCap = makeCtx({ usage: { tokens: 89000, contextWindow: 100000 } });
+	await pi.fireInput({ text: "hi" }, belowCap.ctx);
+	assert.equal(belowCap.compacts.length, 0);
+	const small = makeCtx({ usage: { tokens: 90000, contextWindow: 100000 } });
 	await pi.fireInput({ text: "hi" }, small.ctx);
-	assert.equal(small.compacts.length, 0, "window below the budget: skipped");
+	assert.equal(small.compacts.length, 1, "90% triggers below the budget");
+	const equalWindow = makeCtx({ usage: { tokens: 135000, contextWindow: 150000 } });
+	await pi.fireInput({ text: "hi" }, equalWindow.ctx);
+	assert.equal(equalWindow.compacts.length, 1, "window equal to budget also uses 90%");
 
-	// Mirror: reserveTokens = window - budget, per model; unreachable ones skipped.
+	// Mirror the same rule for every provider, including 9router.
 	const settingsFile = join(agentDir, "settings.json");
 	writeFileSync(settingsFile, JSON.stringify({}), "utf8");
 	const mirror = makeCtx({
 		usage: undefined,
 		availableModels: [
 			{ provider: "big", id: "m", contextWindow: 1000000 },
-			{ provider: "small", id: "m", contextWindow: 100000 },
+			{ provider: "9router", id: "m", contextWindow: 100000 },
 		],
 	});
 	mirror.ctx.model = { provider: "big", id: "m", contextWindow: 1000000 };
@@ -487,11 +492,11 @@ test("a token budget triggers early on large windows and skips unreachable ones"
 		"1M window: 1000000 - 150000 budget",
 	);
 	assert.equal(
-		saved.compaction.modelOverrides["small/m"],
-		undefined,
-		"100k window cannot reach 150k, so Pi's own default stays",
+		saved.compaction.modelOverrides["9router/m"].reserveTokens,
+		10000,
+		"9router 100k window uses the 90% cap",
 	);
-	assert.match(mirror.notifies.at(-1)!.text, /1 model\(s\)/);
+	assert.match(mirror.notifies.at(-1)!.text, /2 model\(s\)/);
 });
 
 test("an out-of-range hand-edited thresholdTokens falls back to the last valid value", async () => {
@@ -525,7 +530,7 @@ test("/compact-threshold persists atomically, merges keys, validates input", asy
 	const h = makeCtx({ usage: undefined });
 
 	await cmd.handler("", h.ctx);
-	assert.equal(h.notifies.at(-1)!.text, "Auto-compaction limit: 78000 tokens");
+	assert.equal(h.notifies.at(-1)!.text, "Auto-compaction limit: 78000 tokens (capped at 90% of model context window)");
 
 	await cmd.handler("62000", h.ctx);
 	const saved = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
