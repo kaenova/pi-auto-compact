@@ -557,6 +557,26 @@ test("/compact-threshold persists atomically, merges keys, validates input", asy
 	assert.ok(!existsSync(CONFIG_FILE), "reset removes the config file");
 });
 
+test("native auto-compaction is enabled even when model reserves are unchanged", () => {
+	const settingsFile = join(agentDir, "settings.json");
+	writeFileSync(settingsFile, JSON.stringify({
+		theme: "dark",
+		compaction: { enabled: false, keepRecentTokens: 123, modelOverrides: {} },
+	}));
+	const pi = install(makePi());
+	const h = makeCtx({ usage: undefined });
+	pi.fireSessionStart(h.ctx);
+	const saved = JSON.parse(readFileSync(settingsFile, "utf8"));
+	assert.equal(saved.compaction.enabled, true);
+	assert.equal(saved.compaction.keepRecentTokens, 123);
+	assert.equal(saved.theme, "dark");
+	assert.match(h.notifies.at(-1)!.text, /Native auto-compaction enabled/);
+	assert.match(h.notifies.at(-1)!.text, /reload or restart/);
+	const again = makeCtx({ usage: undefined });
+	pi.fireSessionStart(again.ctx);
+	assert.equal(again.notifies.length, 0);
+});
+
 test("settings.json is backed up once, before the first mirror write", async () => {
 	const settingsFile = join(agentDir, "settings.json");
 	const backupFile = `${settingsFile}.bak`;
