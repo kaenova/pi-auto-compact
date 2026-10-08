@@ -32,6 +32,8 @@ const { default: createExtension } = await import(
 	"../extensions/auto-compact.ts"
 );
 
+const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
+
 type Handler = (event: any, ctx: any) => any;
 
 interface MockPi {
@@ -79,6 +81,7 @@ interface CtxHarness {
 	ctx: any;
 	compacts: CompactHandler[];
 	statuses: (string | undefined)[];
+	activationStatuses: (string | undefined)[];
 	notifies: { text: string; kind: string }[];
 }
 
@@ -101,8 +104,8 @@ function makeCtx(opts: {
 				else handlers.onError?.(new Error("Nothing to compact"));
 			},
 			ui: {
-				setStatus: (_key: string, text: string | undefined) => {
-					harness.statuses.push(text);
+				setStatus: (key: string, text: string | undefined) => {
+					(key.endsWith("-active") ? harness.activationStatuses : harness.statuses).push(text);
 				},
 				notify: (text: string, kind: string) => {
 					harness.notifies.push({ text, kind });
@@ -112,6 +115,7 @@ function makeCtx(opts: {
 		},
 		compacts,
 		statuses: [],
+		activationStatuses: [],
 		notifies: [],
 	};
 	return harness;
@@ -127,6 +131,32 @@ const WINDOW = 100_000;
 const at = (percent: number) => ({
 	tokens: Math.round((WINDOW * percent) / 100),
 	contextWindow: WINDOW,
+});
+
+test("runtime thresholds hot-reload without changing Pi settings; shutdown restores the method", async () => {
+	const mock = makePi();
+	const pi = install(mock);
+	const before = SettingsManager.prototype.getCompactionSettings;
+	const manager = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 321 } });
+	const model = { provider: "9router", id: "test", contextWindow: 100000 };
+	const h = makeCtx({ usage: undefined });
+	h.ctx.model = model;
+	writeConfig({ thresholdTokens: 150000 });
+	pi.fireSessionStart(h.ctx);
+	assert.equal(h.activationStatuses.at(-1), "auto-compact: on · 90000 tokens");
+	assert.deepEqual(manager.getCompactionSettings(model), { enabled: true, keepRecentTokens: 321, reserveTokens: 10000 });
+	await pi.command("compact-threshold").handler("50000", h.ctx);
+	assert.equal(manager.getCompactionSettings(model).reserveTokens, 50000);
+	assert.equal(h.activationStatuses.at(-1), "auto-compact: on · 50000 tokens");
+	writeConfig({ thresholdTokens: 60000 });
+	assert.equal(manager.getCompactionSettings(model).reserveTokens, 40000);
+	assert.equal(manager.getCompactionEnabled(), false, "underlying setting untouched");
+	mock.events.get("session_shutdown")![0]!({}, h.ctx);
+	assert.equal(SettingsManager.prototype.getCompactionSettings, before);
+	pi.fireSessionStart(h.ctx);
+	assert.equal(manager.getCompactionSettings(model).reserveTokens, 40000, "session switch reinstalls patch");
+	mock.events.get("session_shutdown")![0]!({}, h.ctx);
+	writeConfig({ thresholdTokens: 80000 });
 });
 
 // --- baseline gating ---------------------------------------------------------
@@ -333,120 +363,6 @@ test("threshold hot-reloads from disk between prompts", async () => {
 	assert.equal(tampered.compacts.length, 0, "tampered 0.5% must not take effect");
 });
 
-test("threshold is mirrored into Pi settings.json for every available model", async () => {
-	const settingsFile = join(agentDir, "settings.json");
-	writeFileSync(
-		settingsFile,
-		JSON.stringify({
-			theme: "dark",
-			compaction: {
-				enabled: true,
-				modelOverrides: { "other/model": { reserveTokens: 123 } },
-			},
-		}),
-		"utf8",
-	);
-	writeConfig({ thresholdTokens: 75_000 });
-	const pi = install(makePi());
-	// Small windows use the 90% cap; larger windows use the budget.
-	const h = makeCtx({
-		usage: undefined,
-		availableModels: [
-			{ provider: "anthropic", id: "claude", contextWindow: 200000 },
-			{ provider: "openai", id: "mid", contextWindow: 120000 },
-			{ provider: "openai", id: "mini", contextWindow: 32000 },
-		],
-	});
-	h.ctx.model = { provider: "anthropic", id: "claude", contextWindow: 200000 };
-	pi.fireSessionStart(h.ctx);
-
-	const saved = JSON.parse(readFileSync(settingsFile, "utf8"));
-	assert.deepEqual(saved.compaction.modelOverrides["anthropic/claude"], {
-		reserveTokens: 125000,
-	});
-	assert.deepEqual(
-		saved.compaction.modelOverrides["openai/mid"],
-		{ reserveTokens: 45000 },
-		"every model that can reach the budget gets window - budget",
-	);
-	assert.deepEqual(
-		saved.compaction.modelOverrides["openai/mini"],
-		{ reserveTokens: 3200 },
-		"32k window reserves 10%",
-	);
-	assert.equal(
-		saved.compaction.modelOverrides["other/model"].reserveTokens,
-		123,
-		"pre-existing overrides survive",
-	);
-	assert.equal(saved.compaction.enabled, true, "sibling keys survive");
-	assert.equal(saved.theme, "dark", "unrelated settings survive");
-	assert.match(h.notifies.at(-1)!.text, /3 model\(s\)/);
-
-	// Unchanged values: no write, no notification.
-	const before = readFileSync(settingsFile, "utf8");
-	const again = makeCtx({
-		usage: undefined,
-		availableModels: [
-			{ provider: "anthropic", id: "claude", contextWindow: 200000 },
-			{ provider: "openai", id: "mid", contextWindow: 120000 },
-			{ provider: "openai", id: "mini", contextWindow: 32000 },
-		],
-	});
-	again.ctx.model = h.ctx.model;
-	pi.fireSessionStart(again.ctx);
-	assert.equal(readFileSync(settingsFile, "utf8"), before, "idempotent");
-	assert.equal(again.notifies.length, 0);
-
-	// Active model is mirrored even when the registry does not list it.
-	const unlisted = makeCtx({ usage: undefined });
-	unlisted.ctx.model = {
-		provider: "custom",
-		id: "local",
-		contextWindow: 400000,
-	};
-	pi.fireSessionStart(unlisted.ctx);
-	assert.deepEqual(
-		JSON.parse(readFileSync(settingsFile, "utf8")).compaction.modelOverrides[
-			"custom/local"
-		],
-		{ reserveTokens: 325000 },
-	);
-
-	// No usable model at all: nothing is written.
-	const noModel = makeCtx({ usage: undefined });
-	const unchanged = readFileSync(settingsFile, "utf8");
-	pi.fireSessionStart(noModel.ctx);
-	assert.equal(readFileSync(settingsFile, "utf8"), unchanged);
-});
-
-test("/compact-threshold re-syncs the mirrored reserveTokens", async () => {
-	writeConfig({ thresholdTokens: 80_000 });
-	const settingsFile = join(agentDir, "settings.json");
-	writeFileSync(settingsFile, JSON.stringify({}), "utf8");
-	const pi = install(makePi());
-	const h = makeCtx({ usage: undefined });
-	// 1M so that the 150_000 default is reachable after the reset.
-	h.ctx.model = { provider: "anthropic", id: "claude", contextWindow: 1000000 };
-
-	await pi.command("compact-threshold").handler("50000", h.ctx);
-	assert.equal(
-		JSON.parse(readFileSync(settingsFile, "utf8")).compaction.modelOverrides[
-			"anthropic/claude"
-		].reserveTokens,
-		950000,
-	);
-
-	await pi.command("compact-threshold").handler("reset", h.ctx);
-	assert.equal(
-		JSON.parse(readFileSync(settingsFile, "utf8")).compaction.modelOverrides[
-			"anthropic/claude"
-		].reserveTokens,
-		850000,
-		"reset restores the 150_000-token default",
-	);
-});
-
 test("all providers use the lower of the budget and 90% of the window", async () => {
 	const pi = install(makePi());
 	writeConfig({ thresholdTokens: 150_000 });
@@ -473,30 +389,7 @@ test("all providers use the lower of the budget and 90% of the window", async ()
 	await pi.fireInput({ text: "hi" }, equalWindow.ctx);
 	assert.equal(equalWindow.compacts.length, 1, "window equal to budget also uses 90%");
 
-	// Mirror the same rule for every provider, including 9router.
-	const settingsFile = join(agentDir, "settings.json");
-	writeFileSync(settingsFile, JSON.stringify({}), "utf8");
-	const mirror = makeCtx({
-		usage: undefined,
-		availableModels: [
-			{ provider: "big", id: "m", contextWindow: 1000000 },
-			{ provider: "9router", id: "m", contextWindow: 100000 },
-		],
-	});
-	mirror.ctx.model = { provider: "big", id: "m", contextWindow: 1000000 };
-	pi.fireSessionStart(mirror.ctx);
-	const saved = JSON.parse(readFileSync(settingsFile, "utf8"));
-	assert.equal(
-		saved.compaction.modelOverrides["big/m"].reserveTokens,
-		850000,
-		"1M window: 1000000 - 150000 budget",
-	);
-	assert.equal(
-		saved.compaction.modelOverrides["9router/m"].reserveTokens,
-		10000,
-		"9router 100k window uses the 90% cap",
-	);
-	assert.match(mirror.notifies.at(-1)!.text, /2 model\(s\)/);
+
 });
 
 test("an out-of-range hand-edited thresholdTokens falls back to the last valid value", async () => {
@@ -557,70 +450,3 @@ test("/compact-threshold persists atomically, merges keys, validates input", asy
 	assert.ok(!existsSync(CONFIG_FILE), "reset removes the config file");
 });
 
-test("native auto-compaction is enabled even when model reserves are unchanged", () => {
-	const settingsFile = join(agentDir, "settings.json");
-	writeFileSync(settingsFile, JSON.stringify({
-		theme: "dark",
-		compaction: { enabled: false, keepRecentTokens: 123, modelOverrides: {} },
-	}));
-	const pi = install(makePi());
-	const h = makeCtx({ usage: undefined });
-	pi.fireSessionStart(h.ctx);
-	const saved = JSON.parse(readFileSync(settingsFile, "utf8"));
-	assert.equal(saved.compaction.enabled, true);
-	assert.equal(saved.compaction.keepRecentTokens, 123);
-	assert.equal(saved.theme, "dark");
-	assert.match(h.notifies.at(-1)!.text, /Native auto-compaction enabled/);
-	assert.match(h.notifies.at(-1)!.text, /reload or restart/);
-	const again = makeCtx({ usage: undefined });
-	pi.fireSessionStart(again.ctx);
-	assert.equal(again.notifies.length, 0);
-});
-
-test("settings.json is backed up once, before the first mirror write", async () => {
-	const settingsFile = join(agentDir, "settings.json");
-	const backupFile = `${settingsFile}.bak`;
-	// Earlier tests may have mirrored already; start from a known state.
-	rmSync(backupFile, { force: true });
-
-	// Sentinel original: none of this is ours, so a faithful backup returns it verbatim.
-	const original = `${JSON.stringify({ theme: "dark", compaction: { enabled: true } }, null, 2)}\n`;
-	writeFileSync(settingsFile, original, "utf8");
-	writeConfig({ thresholdTokens: 90_000 });
-
-	const pi = install(makePi());
-	const first = makeCtx({ usage: undefined });
-	first.ctx.model = { provider: "anthropic", id: "claude", contextWindow: 200000 };
-	pi.fireSessionStart(first.ctx);
-
-	assert.equal(
-		readFileSync(backupFile, "utf8"),
-		original,
-		"backup holds the pre-extension settings verbatim",
-	);
-	assert.equal(
-		JSON.parse(readFileSync(settingsFile, "utf8")).compaction.modelOverrides[
-			"anthropic/claude"
-		].reserveTokens,
-		110000,
-		"the live file did get the mirror",
-	);
-
-	// A second write must not rotate the backup, or the true original is lost.
-	const second = makeCtx({ usage: undefined });
-	second.ctx.model = { provider: "openai", id: "big", contextWindow: 400000 };
-	pi.fireSessionStart(second.ctx);
-
-	assert.equal(
-		readFileSync(backupFile, "utf8"),
-		original,
-		"backup is written once and never rotated over the true original",
-	);
-	assert.equal(
-		JSON.parse(readFileSync(settingsFile, "utf8")).compaction.modelOverrides[
-			"openai/big"
-		].reserveTokens,
-		310000,
-		"later models still get mirrored",
-	);
-});
