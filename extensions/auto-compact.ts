@@ -1,6 +1,4 @@
 import {
-	copyFileSync,
-	existsSync,
 	mkdirSync,
 	readFileSync,
 	renameSync,
@@ -10,6 +8,7 @@ import {
 import { dirname, join } from "node:path";
 import {
 	estimateTokens,
+	SettingsManager,
 	getAgentDir,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -23,10 +22,6 @@ const DEFAULT_THRESHOLD_TOKENS = 150000;
 const MIN_THRESHOLD_TOKENS = 1000;
 const STATUS_KEY = "pi-auto-compact";
 const CONFIG_FILE = join(getAgentDir(), "pi-auto-compact.json");
-/** Pi's own global settings file, where `compaction.modelOverrides` lives. */
-const SETTINGS_FILE = join(getAgentDir(), "settings.json");
-/** One-time copy of SETTINGS_FILE, taken before the first mirror write. */
-const SETTINGS_BACKUP_FILE = `${SETTINGS_FILE}.bak`;
 /** Compaction errors meaning "the context is already as small as it can get" — safe to send the prompt anyway. */
 const SOFT_COMPACT_ERRORS = ["Nothing to compact", "Already compacted"];
 
@@ -45,7 +40,7 @@ function parseConfig(raw: unknown, fallback: CompactConfig): CompactConfig {
 	return {
 		thresholdTokens:
 			typeof tokens === "number" &&
-			Number.isInteger(tokens) &&
+			Number.isSafeInteger(tokens) &&
 			tokens >= MIN_THRESHOLD_TOKENS
 				? tokens
 				: fallback.thresholdTokens,
@@ -75,26 +70,6 @@ function resolveLimit(
 /** Human-readable summary of the active rule, for notifications. */
 function describeConfig(config: CompactConfig): string {
 	return `${config.thresholdTokens} tokens (capped at 90% of model context window)`;
-}
-
-/**
- * Copy Pi's settings aside before the first mirror write, so the pre-extension
- * state is always recoverable.
- *
- * Written once and never rotated: a rotating backup would eventually overwrite
- * the true original with an already-mirrored file. Best-effort — the mirror
- * write only adds `modelOverrides` and merges, so it cannot lose data, and a
- * failed copy must not block the setting the user asked for.
- * ponytail: single backup, no history. Add rotation if multi-step undo is needed.
- */
-function backupSettingsOnce(): void {
-	try {
-		if (existsSync(SETTINGS_BACKUP_FILE)) return;
-		if (!existsSync(SETTINGS_FILE)) return;
-		copyFileSync(SETTINGS_FILE, SETTINGS_BACKUP_FILE);
-	} catch {
-		// See above: never block the mirror write on a failed backup.
-	}
 }
 
 function readJsonObject(file: string): Record<string, unknown> {
@@ -130,50 +105,6 @@ function saveConfig(config: CompactConfig): void {
 		...readJsonObject(CONFIG_FILE),
 		thresholdTokens: config.thresholdTokens,
 	});
-}
-
-type ModelLike = { provider: string; id: string; contextWindow: number };
-
-/**
- * Mirror the compaction limit into Pi's own settings, so Pi's between-turn check
- * (`contextTokens > contextWindow - reserveTokens`) fires at the same point for
- * content the preflight cannot see (steer/followUp queues, skill/template
- * expansion). The limit is window-dependent, so this writes one override per
- * model, capped at 90% of its context window. Unknown windows are skipped.
- * Existing overrides for other models and unrelated settings are preserved. Pi
- * caches settings, so a change only applies after /reload or a restart. Returns
- * the number of overrides written, plus whether native compaction was enabled.
- */
-function syncPiReserveTokens(
-	models: readonly ModelLike[],
-	config: CompactConfig,
-): { written: number; enabled: boolean } {
-	const settings = readJsonObject(SETTINGS_FILE);
-	const compaction = (settings.compaction ?? {}) as Record<string, unknown>;
-	const overrides = {
-		...((compaction.modelOverrides as Record<string, unknown>) ?? {}),
-	};
-	let written = 0;
-	for (const model of models) {
-		if (!Number.isFinite(model.contextWindow) || model.contextWindow <= 0)
-			continue;
-		const limit = resolveLimit(config, model.contextWindow);
-		if (limit == null) continue;
-		const key = `${model.provider}/${model.id}`;
-		const reserveTokens = Math.round(model.contextWindow - limit);
-		const existing = overrides[key] as { reserveTokens?: unknown } | undefined;
-		if (existing?.reserveTokens === reserveTokens) continue;
-		overrides[key] = { ...existing, reserveTokens };
-		written++;
-	}
-	const enabled = compaction.enabled === false;
-	if (written === 0 && !enabled) return { written, enabled };
-	backupSettingsOnce();
-	writeJsonAtomic(SETTINGS_FILE, {
-		...settings,
-		compaction: { ...compaction, enabled: true, modelOverrides: overrides },
-	});
-	return { written, enabled };
 }
 
 type StatusKind = "info" | "warning" | "error";
@@ -223,34 +154,44 @@ function isSoftCompactionError(error: Error): boolean {
 	return SOFT_COMPACT_ERRORS.some((message) => error.message.includes(message));
 }
 
-/**
- * Mirror the limit for every model Pi could use, plus the active one, so the
- * rule stays model-independent: whichever model is selected, Pi's own
- * between-turn check fires at our limit. The active model is added separately
- * because the registry may not list it yet.
- */
-function applyConfigToPi(ctx: ExtensionContext, config: CompactConfig): void {
-	try {
-		const models = new Map<string, ModelLike>();
-		for (const model of ctx.modelRegistry.getAvailable())
-			models.set(`${model.provider}/${model.id}`, model);
-		if (ctx.model)
-			models.set(`${ctx.model.provider}/${ctx.model.id}`, ctx.model);
-		const { written, enabled } = syncPiReserveTokens([...models.values()], config);
-		if (written === 0 && !enabled) return;
-		notifySafe(
-			ctx,
-			`Pi compaction limit mirrored at ${describeConfig(config)} for ${written} model(s) (${SETTINGS_FILE}).${enabled ? " Native auto-compaction enabled for running agents." : ""} Run /reload or restart Pi to apply.`,
-			"info",
-		);
-	} catch {
-		notifySafe(ctx, "Could not update Pi settings.json", "warning");
-	}
-}
-
 export default function (pi: ExtensionAPI) {
 	/** Last-known valid config; re-read from disk before each prompt (hot reload). */
 	let config = loadConfig();
+	let original: typeof SettingsManager.prototype.getCompactionSettings | undefined;
+	// ponytail: process-wide SDK patch. Replace with a public runtime settings API when Pi exposes one.
+	const patched: typeof SettingsManager.prototype.getCompactionSettings = function (this: SettingsManager, model) {
+		const settings = original!.call(this, model);
+		config = loadConfig(config);
+		const window = (model as { contextWindow?: number } | undefined)?.contextWindow;
+		const limit = window == null ? undefined : resolveLimit(config, window);
+		return limit == null ? settings : {
+			...settings,
+			enabled: true,
+			reserveTokens: Math.round(window! - limit),
+		};
+	};
+	function updateActivationStatus(ctx: ExtensionContext) {
+		if (!ctx.hasUI) return;
+		const limit = ctx.model ? resolveLimit(config, ctx.model.contextWindow) : undefined;
+		try {
+			ctx.ui.setStatus(`${STATUS_KEY}-active`, SettingsManager.prototype.getCompactionSettings !== patched
+				? "auto-compact: runtime override inactive"
+				: limit == null
+				? "auto-compact: native fallback (window unknown)"
+				: `auto-compact: on · ${limit} tokens`);
+		} catch { /* Session context may be stale. */ }
+	}
+	function installRuntimePatch() {
+		if (original) return;
+		original = SettingsManager.prototype.getCompactionSettings;
+		SettingsManager.prototype.getCompactionSettings = patched;
+	}
+	function removeRuntimePatch() {
+		if (SettingsManager.prototype.getCompactionSettings === patched) {
+			SettingsManager.prototype.getCompactionSettings = original!;
+			original = undefined;
+		}
+	}
 	/** Bumped on session start/shutdown so async callbacks can detect a replaced session. */
 	let sessionGeneration = 0;
 	/** Shared in-flight preflight compaction; resolves to the failure (or null) once the compaction attempt settles. */
@@ -289,16 +230,19 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		sessionGeneration++;
 		setStatus(ctx, undefined);
-		applyConfigToPi(ctx, (config = loadConfig(config)));
+		config = loadConfig(config);
+		installRuntimePatch();
+		updateActivationStatus(ctx);
 	});
 
-	// A model switch can reveal models that gained auth since startup.
 	pi.on("model_select", (_event, ctx) => {
-		applyConfigToPi(ctx, config);
+		config = loadConfig(config);
+		updateActivationStatus(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
 		sessionGeneration++;
+		removeRuntimePatch();
 	});
 
 	pi.registerCommand("compact-threshold", {
@@ -317,7 +261,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					rmSync(CONFIG_FILE, { force: true });
 					config = DEFAULT_CONFIG;
-					applyConfigToPi(ctx, config);
+					updateActivationStatus(ctx);
 					ctx.ui.notify(
 						`Auto-compaction limit reset to ${describeConfig(config)}`,
 						"info",
@@ -329,7 +273,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const value = Number(input);
-			if (!Number.isInteger(value) || value < MIN_THRESHOLD_TOKENS) {
+			if (!Number.isSafeInteger(value) || value < MIN_THRESHOLD_TOKENS) {
 				ctx.ui.notify(
 					`Usage: /compact-threshold <${MIN_THRESHOLD_TOKENS}+> (a token budget), or reset`,
 					"warning",
@@ -342,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 				const next: CompactConfig = { thresholdTokens: value };
 				saveConfig(next);
 				config = next;
-				applyConfigToPi(ctx, config);
+				updateActivationStatus(ctx);
 				ctx.ui.notify(
 					`Auto-compaction limit set to ${describeConfig(config)}`,
 					"info",
@@ -357,6 +301,7 @@ export default function (pi: ExtensionAPI) {
 	// prompt will trigger a preflight compaction. No compaction happens here.
 	pi.on("turn_end", (_event, ctx) => {
 		config = loadConfig(config);
+		updateActivationStatus(ctx);
 		const usage = getValidUsage(ctx);
 		if (!usage) {
 			setStatus(ctx, undefined);
@@ -382,6 +327,7 @@ export default function (pi: ExtensionAPI) {
 
 		// Re-read per prompt so /compact-threshold changes from other sessions apply here.
 		config = loadConfig(config);
+		updateActivationStatus(ctx);
 		const usage = getValidUsage(ctx);
 		if (!usage) return { action: "continue" };
 		const limit = resolveLimit(config, usage.contextWindow);
